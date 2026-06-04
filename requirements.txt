@@ -6,6 +6,7 @@ lxml>=5.0.0
 # ML & embeddings
 torch>=2.0.0
 transformers>=4.40.0
+protobuf>=3.20.3
 sentencepiece>=0.2.0
 pillow>=10.0.0
 accelerate>=0.30.0  # For efficient model loading
