@@ -1,0 +1,78 @@
+name: Scrape Rebalance Vintage
+
+on:
+  # Scheduled: Monday and Thursday at 16:30 UTC
+  schedule:
+    - cron: "30 16 * * 1,4"
+  # Manual trigger from GitHub UI
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      TORCH_DEVICE: cpu
+      SCRAPE_ALL: "true"
+      HTTP_CONCURRENCY: "10"
+      REQUEST_DELAY: "0.5"
+      DB_BATCH_SIZE: "50"
+      EMBEDDING_BATCH_SIZE: "8"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
+
+      - name: Install PyTorch (CPU)
+        run: |
+          pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Verify imports
+        run: |
+          python -c "
+            import sys
+            print(f'Python {sys.version}')
+            from src.config import CATEGORY_URLS, TORCH_DEVICE
+            print(f'✅ Config loaded: {len(CATEGORY_URLS)} categories, device={TORCH_DEVICE}')
+            from src.scraper import build_product_record, scrape_all_products
+            print('✅ Scraper module loaded')
+            from src.embeddings import generate_all_embeddings
+            print('✅ Embeddings module loaded')
+            from src.database import upsert_all_products
+            print('✅ Database module loaded')
+            print('All imports successful!')
+          "
+
+      - name: Run scraper (full pipeline)
+        run: |
+          python -m src.main
+
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scraped-data
+          path: data/
+          retention-days: 7
+
+      - name: Log completion
+        run: |
+          echo "✅ Scrape completed at $(date -u)"
