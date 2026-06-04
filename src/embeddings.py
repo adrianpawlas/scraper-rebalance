@@ -1,16 +1,21 @@
 """
 Embedding generation using Google's SIGLIP model.
 
-Model: google/siglip-base-patch16-384 → 768-dim embeddings
+Model: google/siglip-base-patch16-384 -> 768-dim embeddings
 - Image embedding: SiglipVisionModel (vision tower)
 - Text embedding:  SiglipTextModel  (text tower, same dim)
+
+Features:
+- Staggered 0.5s delay between individual image embeddings
+- Only embeds products that need it (new or image URL changed)
+- Chunked image processing for memory efficiency
 """
 
 from __future__ import annotations
 
 import io
 import logging
-from pathlib import Path
+import time
 from typing import Any
 
 import httpx
@@ -20,7 +25,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 from transformers import (
     AutoProcessor,
-    SiglipModel,
     SiglipTextModel,
     SiglipVisionModel,
 )
@@ -31,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 # ── Global model references (lazy-loaded) ─────────────────────────────────────
 
-_model: SiglipModel | None = None
 _vision_model: SiglipVisionModel | None = None
 _text_model: SiglipTextModel | None = None
 _processor: AutoProcessor | None = None
@@ -40,25 +43,21 @@ _device: torch.device | None = None
 
 def _ensure_model():
     """Lazy-load the SIGLIP model and processor."""
-    global _model, _vision_model, _text_model, _processor, _device
+    global _vision_model, _text_model, _processor, _device
 
     if _processor is not None:
         return
 
     _device = torch.device(TORCH_DEVICE)
-    logger.info(f"📦 Loading SIGLIP model: {EMBEDDING_MODEL} on {_device}")
+    logger.info(f"Loading SIGLIP model: {EMBEDDING_MODEL} on {_device}")
 
     _processor = AutoProcessor.from_pretrained(EMBEDDING_MODEL)
-
-    # Load the full model for text embeddings (shared text tower)
-    # Load separate vision model for image embeddings
     _vision_model = SiglipVisionModel.from_pretrained(EMBEDDING_MODEL).to(_device)
     _text_model = SiglipTextModel.from_pretrained(EMBEDDING_MODEL).to(_device)
-
     _vision_model.eval()
     _text_model.eval()
 
-    logger.info(f"✅ SIGLIP model loaded (dim={EMBEDDING_DIM})")
+    logger.info(f"SIGLIP model loaded (dim={EMBEDDING_DIM})")
 
 
 @retry(
@@ -82,53 +81,34 @@ def _download_image(url: str) -> Image.Image:
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
-# ── Image Embedding ───────────────────────────────────────────────────────────
+# ── Image Embedding (with stagger delay) ──────────────────────────────────────
 
 
-def embed_image(image_url: str) -> list[float] | None:
-    """
-    Generate a 768-dim image embedding for a single product image.
-    Returns a list of floats or None on failure.
-    """
-    _ensure_model()
-    try:
-        image = _download_image(image_url)
-    except Exception as e:
-        logger.warning(f"⚠️  Failed to download image {image_url}: {e}")
-        return None
-
-    try:
-        inputs = _processor(images=image, return_tensors="pt").to(_device)
-        with torch.no_grad():
-            outputs = _vision_model(**inputs)
-            # pooler_output is the [CLS] token embedding → 768-dim
-            embedding = outputs.pooler_output  # shape: (1, 768)
-        return embedding.cpu().squeeze().tolist()
-    except Exception as e:
-        logger.warning(f"⚠️  Failed to embed image {image_url}: {e}")
-        return None
-
-
-def embed_images_batch(
+def embed_images_batch_with_stagger(
     image_urls: list[str],
 ) -> list[list[float] | None]:
     """
-    Generate image embeddings for a batch of image URLs.
+    Generate image embeddings for product images with a 0.5s stagger delay
+    between chunks to avoid overwhelming the system.
+
     Downloads and processes images in small chunks to avoid memory pressure.
-    Returns a list of embeddings (or None for failures).
+    Returns a list of embeddings (or None for failures), one per URL.
     """
     _ensure_model()
-
     results: list[list[float] | None] = [None] * len(image_urls)
 
-    with tqdm(total=len(image_urls), desc="📸 Image embeddings", unit=" img") as pbar:
-        # Process in small chunks: download + infer together to free memory
+    with tqdm(total=len(image_urls), desc="Image embeddings", unit=" img") as pbar:
         chunk_size = max(1, EMBEDDING_BATCH_SIZE)
         for chunk_start in range(0, len(image_urls), chunk_size):
-            chunk_urls = image_urls[chunk_start : chunk_start + chunk_size]
-            chunk_indices = list(range(chunk_start, min(chunk_start + chunk_size, len(image_urls))))
+            chunk_urls = image_urls[chunk_start: chunk_start + chunk_size]
+            chunk_indices = list(
+                range(chunk_start, min(chunk_start + chunk_size, len(image_urls)))
+            )
 
-            # Download this chunk
+            # Stagger: 0.5s delay before each chunk (except the first)
+            if chunk_start > 0:
+                time.sleep(0.5)
+
             images: list[Image.Image] = []
             valid_indices: list[int] = []
             for i, url in zip(chunk_indices, chunk_urls):
@@ -137,14 +117,13 @@ def embed_images_batch(
                     images.append(img)
                     valid_indices.append(i)
                 except Exception as e:
-                    logger.warning(f"⚠️  Failed to download {url}: {e}")
+                    logger.warning(f"Failed to download {url}: {e}")
                     pbar.update(1)
 
             if not images:
                 pbar.update(len(chunk_urls) - len(images))
                 continue
 
-            # Process this chunk's images
             try:
                 inputs = _processor(images=images, return_tensors="pt", padding=True).to(_device)
                 with torch.no_grad():
@@ -153,8 +132,7 @@ def embed_images_batch(
                 for idx, emb in zip(valid_indices, embeddings.cpu()):
                     results[idx] = emb.tolist()
             except Exception as e:
-                logger.warning(f"⚠️  Chunk embedding failed at offset {chunk_start}: {e}")
-                # Retry individually for this chunk
+                logger.warning(f"Chunk embedding failed at offset {chunk_start}: {e}")
                 for idx, img in zip(valid_indices, images):
                     try:
                         inp = _processor(images=img, return_tensors="pt").to(_device)
@@ -162,11 +140,10 @@ def embed_images_batch(
                             out = _vision_model(**inp)
                             results[idx] = out.pooler_output.cpu().squeeze().tolist()
                     except Exception as e2:
-                        logger.warning(f"⚠️  Individual image embedding failed: {e2}")
+                        logger.warning(f"Individual image embedding failed: {e2}")
 
-            # Free memory
-            del images, inputs, outputs, embeddings
-            if torch.cuda.is_available():
+            del images
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             pbar.update(len(chunk_urls))
@@ -239,9 +216,7 @@ def _prepare_text_for_embedding(record: dict[str, Any]) -> str:
 
 
 def embed_text(text: str) -> list[float]:
-    """
-    Generate a 768-dim text embedding using SIGLIP's text encoder.
-    """
+    """Generate a 768-dim text embedding using SIGLIP's text encoder."""
     _ensure_model()
     inputs = _processor(
         text=text,
@@ -258,27 +233,13 @@ def embed_text(text: str) -> list[float]:
     return embedding.cpu().squeeze().tolist()
 
 
-def embed_info_text(record: dict[str, Any]) -> list[float]:
-    """
-    Generate a text embedding from all product info fields.
-    """
-    text = _prepare_text_for_embedding(record)
-    return embed_text(text)
-
-
-# ── Batch text embedding ──────────────────────────────────────────────────────
-
-
 def embed_texts_batch(texts: list[str], pbar: tqdm | None = None) -> list[list[float]]:
-    """
-    Generate text embeddings for a batch of text strings.
-    Optionally accepts a tqdm progress bar to update.
-    """
+    """Generate text embeddings for a batch of text strings."""
     _ensure_model()
     results: list[list[float]] = []
 
     for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch = texts[start : start + EMBEDDING_BATCH_SIZE]
+        batch = texts[start: start + EMBEDDING_BATCH_SIZE]
         try:
             inputs = _processor(
                 text=batch,
@@ -292,8 +253,7 @@ def embed_texts_batch(texts: list[str], pbar: tqdm | None = None) -> list[list[f
                 embeddings = outputs.pooler_output  # (B, 768)
             results.extend(emb.cpu().tolist() for emb in embeddings)
         except Exception as e:
-            logger.warning(f"⚠️  Text batch embedding failed at offset {start}: {e}")
-            # Fall back to individual
+            logger.warning(f"Text batch embedding failed at offset {start}: {e}")
             for t in batch:
                 results.append(embed_text(t))
 
@@ -303,60 +263,67 @@ def embed_texts_batch(texts: list[str], pbar: tqdm | None = None) -> list[list[f
     return results
 
 
-# ── Process all products ──────────────────────────────────────────────────────
+# ── Targeted embedding generation ─────────────────────────────────────────────
 
 
-def generate_all_embeddings(
+def generate_embeddings_for_products(
     products: dict[str, dict[str, Any]],
+    handles_to_embed: list[str],
 ) -> dict[str, dict[str, Any]]:
     """
-    Generate image and text embeddings for all products.
-    Returns the products dict with embeddings filled in.
-    """
-    _ensure_model()
+    Generate image and text embeddings only for the specified product handles.
+    Skips products not in the list.
 
-    product_handles = list(products.keys())
+    Returns the updated products dict.
+    """
+    if not handles_to_embed:
+        print("   No products need embedding — skipping")
+        return products
+
+    _ensure_model()
     print(f"\n{'='*60}")
-    print(f"🧠 Generating embeddings for {len(product_handles)} products")
+    print(f"Generating embeddings for {len(handles_to_embed)} products")
     print(f"{'='*60}")
 
-    # ── Image embeddings ─────────────────────────────────────────────────
-    print("\n📸 Processing image embeddings...")
-    image_urls: list[str | None] = []
-    valid_handles_img: list[str] = []
-    for h in product_handles:
+    # ── Image embeddings (with 0.5s stagger) ──────────────────────────────
+    print(f"\nProcessing image embeddings ({len(handles_to_embed)} products)...")
+    image_urls: list[str] = []
+    valid_handles: list[str] = []
+    for h in handles_to_embed:
         url = products[h].get("image_url")
         if url:
             image_urls.append(url)
-            valid_handles_img.append(h)
+            valid_handles.append(h)
         else:
             products[h]["image_embedding"] = None
 
     if image_urls:
-        image_embeddings = embed_images_batch(image_urls)
-        for h, emb in zip(valid_handles_img, image_embeddings):
+        image_embeddings = embed_images_batch_with_stagger(image_urls)
+        for h, emb in zip(valid_handles, image_embeddings):
             products[h]["image_embedding"] = emb
 
     # ── Text embeddings ──────────────────────────────────────────────────
-    print("\n📝 Processing text (info) embeddings...")
+    print(f"\nProcessing text embeddings ({len(handles_to_embed)} products)...")
     texts: list[str] = []
-    valid_handles_text: list[str] = []
-    for h in product_handles:
+    text_handles: list[str] = []
+    for h in handles_to_embed:
         text = _prepare_text_for_embedding(products[h])
         if text.strip():
             texts.append(text)
-            valid_handles_text.append(h)
+            text_handles.append(h)
         else:
             products[h]["info_embedding"] = None
 
     if texts:
-        with tqdm(total=len(texts), desc="🔤 Text embeddings", unit=" text") as pbar:
+        with tqdm(total=len(texts), desc="Text embeddings", unit=" text") as pbar:
             text_embeddings = embed_texts_batch(texts, pbar=pbar)
-            for h, emb in zip(valid_handles_text, text_embeddings):
+            for h, emb in zip(text_handles, text_embeddings):
                 products[h]["info_embedding"] = emb
 
-    print(f"\n✅ Embeddings complete! "
-          f"Image: {sum(1 for p in products.values() if p['image_embedding'])}/{len(products)}, "
-          f"Text: {sum(1 for p in products.values() if p['info_embedding'])}/{len(products)}")
+    image_count = sum(1 for h in handles_to_embed if products[h].get("image_embedding"))
+    info_count = sum(1 for h in handles_to_embed if products[h].get("info_embedding"))
+    print(f"\nEmbedding summary for this batch:")
+    print(f"   Image embeddings: {image_count}/{len(handles_to_embed)}")
+    print(f"   Info embeddings:  {info_count}/{len(handles_to_embed)}")
 
     return products

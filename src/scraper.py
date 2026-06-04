@@ -154,7 +154,7 @@ def build_product_record(
     sale_str: str | None = None
 
     if raw_compare and raw_compare != "0":
-        # compare_at_price is set → item is on sale
+        # compare_at_price is set -> item is on sale
         # price = original, sale = current (sale price)
         price_str = f"{raw_compare}{CURRENCY}" if raw_compare else None
         sale_str = f"{raw_price}{CURRENCY}" if raw_price else None
@@ -183,7 +183,6 @@ def build_product_record(
     description = _strip_html(body_html) if body_html else None
 
     # ── Tags ──────────────────────────────────────────────────────────────
-    # products.json returns tags as a list, product.json returns as comma-separated string
     tags_raw = product.get("tags", "") or ""
     if isinstance(tags_raw, list):
         tags_list = [t.strip() for t in tags_raw if t.strip()]
@@ -191,7 +190,7 @@ def build_product_record(
         tags_list = [t.strip() for t in tags_raw.split(",") if t.strip()]
     else:
         tags_list = []
-    
+
     tags_lower = (" ".join(tags_list)).lower() if tags_list else ""
 
     # ── Sizes & options ───────────────────────────────────────────────────
@@ -203,22 +202,22 @@ def build_product_record(
     for opt in options:
         opt_name = (opt.get("name") or "").lower()
         opt_values: list[str] = opt.get("values", [])
-        if opt_name == "size" or opt_name == "sizes":
+        if opt_name in ("size", "sizes"):
             size_values = opt_values
-        if opt_name == "color" or opt_name == "colour" or opt_name == "colors":
+        if opt_name in ("color", "colour", "colors"):
             all_colors = opt_values
 
     if size_values:
         sizes_str = ", ".join(size_values)
     elif primary_variant:
-        # Fallback: use option1 from primary variant
         opt1 = primary_variant.get("option1")
         if opt1:
             sizes_str = opt1
 
-    # Combine size & color info for metadata
     variant_title = primary_variant.get("title", "")
-    color_str = ", ".join(all_colors) if all_colors else (variant_title.split(" / ")[-1] if " / " in variant_title else None)
+    color_str = ", ".join(all_colors) if all_colors else (
+        variant_title.split(" / ")[-1] if " / " in variant_title else None
+    )
 
     # ── Metadata ─────────────────────────────────────────────────────────
     metadata = {
@@ -252,16 +251,14 @@ def build_product_record(
     }
 
     # ── Gender inference ─────────────────────────────────────────────────
-    # This is a unisex vintage store, but some items may lean one way
-    # Also check variant titles and tags for gender cues
     gender: str | None = None
     title_lower = product.get("title", "").lower()
     desc_lower = body_html.lower()
     variant_titles = " ".join(v.get("title", "").lower() for v in variants)
     combined = f"{title_lower} {desc_lower} {tags_lower} {variant_titles}"
-    if any(w in combined for w in ["women", "woman", "female", "ladies", "womens"]):
+    if any(w in combined for w in ("women", "woman", "female", "ladies", "womens")):
         gender = "women"
-    elif any(w in combined for w in ["men", "man", "male", "gents", "mens"]):
+    elif any(w in combined for w in ("men", "man", "male", "gents", "mens")):
         gender = "men"
     else:
         gender = "unisex"
@@ -291,7 +288,7 @@ def build_product_record(
         "metadata": json.dumps(metadata, ensure_ascii=False),
         "created_at": now_iso,
         "other": None,
-        # These will be filled later
+        # Will be filled later by embedding pipeline
         "image_embedding": None,
         "info_embedding": None,
         "compressed_image_url": None,
@@ -338,21 +335,21 @@ def save_products_to_disk(products: dict[str, dict[str, Any]]) -> None:
 
 async def scrape_all_products(
     scrape_all: bool = True,
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], set[str]]:
     """
     Scrape all products from all categories with pagination.
-    Returns a dict keyed by product handle (for deduplication).
+
+    Returns:
+        (products_by_handle: dict, seen_handles: set of all product handles found)
     """
     products: dict[str, dict[str, Any]] = {}
+    seen_handles: set[str] = set()
 
-    # Load existing data if resuming
     if not scrape_all:
         products = load_products_from_disk()
         print(f"🔄 Resuming: {len(products)} products already on disk")
 
     semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
-
-    # Track which handles have been seen per-category to build category lists
     handle_categories: dict[str, set[str]] = {}
 
     for handle, display_name in CATEGORY_URLS:
@@ -370,43 +367,40 @@ async def scrape_all_products(
             print(f"⚠️  No products found for '{display_name}'")
             continue
 
-        # Process products
         for raw in raw_products:
             prod_handle = raw.get("handle", "").strip().lower()
             if not prod_handle:
                 continue
 
-            # Track categories for this product
+            seen_handles.add(prod_handle)
+
             if prod_handle not in handle_categories:
                 handle_categories[prod_handle] = set()
             handle_categories[prod_handle].add(display_name)
 
-            # Build record (with categories from first occurrence)
             categories = list(handle_categories[prod_handle])
             if prod_handle not in products:
                 record = build_product_record(raw, categories)
                 products[prod_handle] = record
             else:
-                # Update categories on existing record
                 products[prod_handle]["category"] = ", ".join(
                     sorted(handle_categories[prod_handle])
                 )
 
-            # Update checkpoint periodically
             save_checkpoint({"processed": len(products), "last_category": handle})
 
-        print(f"✅ {display_name}: {len(raw_products)} products → {len(products)} unique total")
+        print(f"✅ {display_name}: {len(raw_products)} products -> {len(products)} unique total")
 
-    # Final update: ensure all products have correct merged categories
+    # Final category merge
     for prod_handle, record in products.items():
         cats = handle_categories.get(prod_handle, set())
         if cats:
             record["category"] = ", ".join(sorted(cats))
 
-    # Save to disk
     save_products_to_disk(products)
     print(f"\n{'='*60}")
-    print(f"🎯 Scraping complete! {len(products)} unique products saved to {OUTPUT_PATH}")
+    print(f"🎯 Scraping complete! {len(products)} unique products, {len(seen_handles)} handles found")
+    print(f"   Data saved to {OUTPUT_PATH}")
     print(f"{'='*60}")
 
-    return products
+    return products, seen_handles
